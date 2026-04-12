@@ -1,0 +1,56 @@
+# DPM and Daml build artifacts
+.daml/
+*.dar
+
+# DPM home directory cache
+.dpm/
+
+# Dependency directories
+node_modules/
+bower_components/
+
+# TypeScript/JavaScript build output
+dist/
+build/
+.next/
+out/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Test reports
+coverage/
+.nyc_output/
+junit.xml
+
+# Temporary files
+*.tmp
+*.temp
+*~
+*.bak
