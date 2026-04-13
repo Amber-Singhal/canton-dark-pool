@@ -1,0 +1,118 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module DarkPool.MatchingEngine where
+
+import DA.Set (Set)
+import DA.Date (Date, addDays, toDateUTC)
+import Daml.Script (Script, getTime)
+import DarkPool.SealedOrder (SealedOrder(..), OrderDirection(..))
+
+-- | Represents a fully confirmed and legally binding trade between two counterparties,
+-- | observable by all involved parties including the operator. This contract serves as
+-- | the golden record for audit and settlement purposes.
+template ConfirmedTrade
+  with
+    operator: Party
+    buyer: Party
+    seller: Party
+    asset: Text
+    quantity: Decimal
+    price: Decimal
+    tradeDate: Date
+    settlementDate: Date
+  where
+    signatory operator, buyer, seller
+
+-- | Represents a potential trade identified by the matching engine. It is proposed
+-- | to both the buyer and seller. The proposal is signed by the buyer and the operator
+-- | upfront. The seller's acceptance is required to form a `ConfirmedTrade`.
+template MatchedTradeProposal
+  with
+    operator: Party
+    buyer: Party
+    seller: Party
+    asset: Text
+    quantity: Decimal
+    price: Decimal
+    tradeDate: Date
+  where
+    signatory operator, buyer
+    observer seller
+
+    -- | The seller accepts the proposed trade, creating a `ConfirmedTrade` contract
+    -- | that is binding on all parties. This action consumes the proposal.
+    choice Accept : ContractId ConfirmedTrade
+      controller seller
+      do
+        -- For simplicity, settlement date is fixed at T+2. A real-world
+        -- implementation might source this from the asset's rules or a calendar service.
+        let settlementDate = addDays tradeDate 2
+        create ConfirmedTrade with
+          operator, buyer, seller, asset, quantity, price, tradeDate, settlementDate
+
+    -- | Either counterparty can reject the proposal, which archives this contract.
+    -- | The operator is expected to handle this event (e.g., via a trigger)
+    -- | and may choose to re-create the original `SealedOrder` contracts for the parties.
+    choice Reject : ()
+      controller buyer, seller
+      do pure ()
+
+-- | The core matching engine contract, controlled by the dark pool operator.
+-- | It provides the functionality to pair compatible buy and sell orders. There should
+-- | only be one such contract per operator on the ledger.
+template MatchingEngine
+  with
+    operator: Party
+    observers: Set Party
+  where
+    signatory operator
+    observer observers
+
+    key operator: Party
+    maintainer key
+
+    -- | Attempts to match a given buy and sell order. If the orders are compatible
+    -- | (same asset, same quantity, and viable price), the original orders are
+    -- | atomically archived and a `MatchedTradeProposal` is created. This reveals the
+    -- | trade details to the counterparties for the first time, requiring their consent
+    -- | to proceed.
+    choice MatchOrders : ContractId MatchedTradeProposal
+      with
+        buyOrderCid: ContractId SealedOrder
+        sellOrderCid: ContractId SealedOrder
+      controller operator
+      do
+        buyOrder <- fetch buyOrderCid
+        sellOrder <- fetch sellOrderCid
+
+        -- Validate that the orders constitute a valid, matchable pair.
+        assertMsg "First order must be a buy order" (buyOrder.direction == Buy)
+        assertMsg "Second order must be a sell order" (sellOrder.direction == Sell)
+        assertMsg "Orders must be for the same asset" (buyOrder.asset == sellOrder.asset)
+        assertMsg "Orders must be for the same quantity for a block trade" (buyOrder.quantity == sellOrder.quantity)
+        assertMsg "Buy limit price must be >= sell limit price" (buyOrder.limitPrice >= sellOrder.limitPrice)
+        assertMsg "Cannot match an order with itself" (buyOrderCid /= sellOrderCid)
+        assertMsg "Cannot match orders from the same counterparty" (buyOrder.counterparty /= sellOrder.counterparty)
+
+        -- The execution price is set to the midpoint of the two limit prices,
+        -- a common and fair pricing mechanism in dark pools.
+        let executionPrice = (buyOrder.limitPrice + sellOrder.limitPrice) / 2.0
+
+        now <- getTime
+        let today = toDateUTC now
+
+        -- Atomically archive the original sealed orders and create the proposal.
+        -- If any step fails, the entire transaction is rolled back, and the
+        -- original orders remain active on the ledger.
+        archive buyOrderCid
+        archive sellOrderCid
+
+        create MatchedTradeProposal with
+          operator = operator
+          buyer = buyOrder.counterparty
+          seller = sellOrder.counterparty
+          asset = buyOrder.asset
+          quantity = buyOrder.quantity
+          price = executionPrice
+          tradeDate = today
