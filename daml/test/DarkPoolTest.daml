@@ -1,0 +1,240 @@
+module DarkPoolTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date as Date
+import DA.Time as Time
+
+import DarkPool.ParticipantRegistry
+import DarkPool.MatchingEngine
+import DarkPool.SealedOrder
+import DarkPool.MatchedTrade
+import DarkPool.AtomicSettlement
+
+-- === Test Setup ===
+
+-- A helper record to hold the parties and initial contracts for tests.
+data TestSetup = TestSetup
+  with
+    operator : Party
+    alice : Party
+    bob : Party
+    registryCid : ContractId ParticipantRegistry
+    engineCid : ContractId MatchingEngine
+
+-- Sets up the common test environment: an operator, two participants (Alice, Bob),
+-- a registry with both participants registered, and a matching engine.
+setup : Script TestSetup
+setup = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "alice")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "bob")
+
+  -- 1. Create the Participant Registry
+  registryCid <- submit operator do
+    createCmd ParticipantRegistry with operator, participants = []
+
+  -- 2. Register Alice and Bob
+  submit operator do exerciseCmd registryCid RegisterParticipant with participant = alice
+  submit operator do exerciseCmd registryCid RegisterParticipant with participant = bob
+
+  -- 3. Create the Matching Engine linked to the registry
+  engineCid <- submit operator do
+    createCmd MatchingEngine with operator, registryCid
+
+  return TestSetup with ..
+
+-- === Test Suite ===
+
+darkPoolTests : Script ()
+darkPoolTests = script do
+  testSuccessfulMatchAndSettle
+  testTradeRejectionBySeller
+  testNoMatchOnPrice
+  testUnregisteredParticipantSubmitFails
+  testSelfMatchFails
+
+-- === Individual Tests ===
+
+-- Test the full happy path:
+-- 1. Two participants submit opposing, crossable sealed orders.
+-- 2. Operator matches the orders, creating a proposal.
+-- 3. Both participants consent to the trade.
+-- 4. A MatchedTrade contract is created.
+-- 5. Settlement is initiated.
+testSuccessfulMatchAndSettle : Script ()
+testSuccessfulMatchAndSettle = script do
+  debug "Running test: testSuccessfulMatchAndSettle"
+  TestSetup{..} <- setup
+
+  -- Alice submits a sealed order to BUY 100 "XYZ" @ 50.00
+  aliceOrderCid <- submit alice do
+    exerciseCmd engineCid SubmitSealedOrder
+      with
+        participant = alice
+        direction = Buy
+        quantity = 100.0
+        asset = "XYZ"
+        limitPrice = Some 50.0
+        detailsHash = "alice_buy_hash_1"
+
+  -- Bob submits a sealed order to SELL 100 "XYZ" @ 49.00
+  bobOrderCid <- submit bob do
+    exerciseCmd engineCid SubmitSealedOrder
+      with
+        participant = bob
+        direction = Sell
+        quantity = 100.0
+        asset = "XYZ"
+        limitPrice = Some 49.0
+        detailsHash = "bob_sell_hash_1"
+
+  -- Operator matches the two orders. The price should be the midpoint (49.50).
+  -- This creates a MatchedTradeProposal.
+  proposalCid <- submit operator do
+    exerciseCmd engineCid MatchOrders
+      with
+        order1Cid = aliceOrderCid
+        order2Cid = bobOrderCid
+
+  -- Alice accepts the trade.
+  proposalCid' <- submit alice do
+    exerciseCmd proposalCid AcceptTrade
+
+  -- Bob accepts the trade. This should archive the proposal and create a MatchedTrade.
+  (matchedTradeCid, _) <- submit bob do
+    exerciseCmd proposalCid' AcceptTrade
+
+  -- Verify the MatchedTrade contract exists with the correct details.
+  Some matchedTrade <- queryContractId bob matchedTradeCid
+  debug $ "Matched Trade: " <> show matchedTrade
+  assertEq matchedTrade.buyer alice
+  assertEq matchedTrade.seller bob
+  assertEq matchedTrade.quantity 100.0
+  assertEq matchedTrade.price 49.5
+  assertEq matchedTrade.asset "XYZ"
+
+  -- Initiate settlement.
+  settlementInstructionCid <- submit operator do
+    exerciseCmd matchedTradeCid InitiateSettlement
+      with settlementTime = Time.time (Date.date 2024 Date.Apr 30) 0 0 0
+
+  -- Verify settlement instruction is on the ledger.
+  Some settlementInstruction <- queryContractId operator settlementInstructionCid
+  assertEq settlementInstruction.buyer alice
+  assertEq settlementInstruction.seller bob
+
+  debug "SUCCESS: testSuccessfulMatchAndSettle"
+  return ()
+
+
+-- Test the rejection path:
+-- 1. Orders are matched, proposal is created.
+-- 2. One party accepts, the other rejects.
+-- 3. The proposal contract is archived, and no MatchedTrade is created.
+testTradeRejectionBySeller : Script ()
+testTradeRejectionBySeller = script do
+  debug "Running test: testTradeRejectionBySeller"
+  TestSetup{..} <- setup
+
+  aliceOrderCid <- submit alice do
+    exerciseCmd engineCid SubmitSealedOrder
+      with participant = alice, direction = Buy, quantity = 200.0, asset = "ABC", limitPrice = Some 110.0, detailsHash = "alice_buy_hash_2"
+
+  bobOrderCid <- submit bob do
+    exerciseCmd engineCid SubmitSealedOrder
+      with participant = bob, direction = Sell, quantity = 200.0, asset = "ABC", limitPrice = Some 108.0, detailsHash = "bob_sell_hash_2"
+
+  proposalCid <- submit operator do
+    exerciseCmd engineCid MatchOrders with order1Cid = aliceOrderCid, order2Cid = bobOrderCid
+
+  -- Alice accepts.
+  proposalCid' <- submit alice do
+    exerciseCmd proposalCid AcceptTrade
+
+  -- Bob rejects. This should archive the proposal.
+  submit bob do
+    exerciseCmd proposalCid' RejectTrade
+
+  -- Verify the proposal is gone.
+  None <- queryContractId @MatchedTradeProposal alice proposalCid'
+  None <- queryContractId @MatchedTradeProposal bob proposalCid'
+
+  -- Verify no MatchedTrade contract was created.
+  contracts <- query @MatchedTrade alice
+  assertEq (length contracts) 0
+
+  debug "SUCCESS: testTradeRejectionBySeller"
+  return ()
+
+-- Test the no-match path where prices do not cross:
+-- 1. Alice's buy limit is lower than Bob's sell limit.
+-- 2. The operator's attempt to match them should fail.
+testNoMatchOnPrice : Script ()
+testNoMatchOnPrice = script do
+  debug "Running test: testNoMatchOnPrice"
+  TestSetup{..} <- setup
+
+  aliceOrderCid <- submit alice do
+    exerciseCmd engineCid SubmitSealedOrder
+      with participant = alice, direction = Buy, quantity = 100.0, asset = "XYZ", limitPrice = Some 49.0, detailsHash = "alice_buy_hash_3"
+
+  bobOrderCid <- submit bob do
+    exerciseCmd engineCid SubmitSealedOrder
+      with participant = bob, direction = Sell, quantity = 100.0, asset = "XYZ", limitPrice = Some 50.0, detailsHash = "bob_sell_hash_3"
+
+  -- Operator's attempt to match should fail because buy price < sell price.
+  submitMustFail operator do
+    exerciseCmd engineCid MatchOrders with order1Cid = aliceOrderCid, order2Cid = bobOrderCid
+
+  -- Verify both original orders still exist.
+  Some _ <- queryContractId alice aliceOrderCid
+  Some _ <- queryContractId bob bobOrderCid
+
+  debug "SUCCESS: testNoMatchOnPrice"
+  return ()
+
+-- Test that a party not registered in the ParticipantRegistry cannot submit an order.
+testUnregisteredParticipantSubmitFails : Script ()
+testUnregisteredParticipantSubmitFails = script do
+  debug "Running test: testUnregisteredParticipantSubmitFails"
+  TestSetup{..} <- setup
+  charlie <- allocatePartyWithHint "Charlie" (PartyIdHint "charlie")
+
+  -- Charlie is not registered, so this should fail.
+  -- The MatchingEngine's SubmitSealedOrder choice should verify participant is in the registry.
+  submitMustFail charlie do
+    exerciseCmd engineCid SubmitSealedOrder
+      with
+        participant = charlie
+        direction = Buy
+        quantity = 50.0
+        asset = "NEW"
+        limitPrice = None
+        detailsHash = "charlie_buy_hash_1"
+
+  debug "SUCCESS: testUnregisteredParticipantSubmitFails"
+  return ()
+
+
+-- Test that the operator cannot match an order with itself.
+testSelfMatchFails : Script ()
+testSelfMatchFails = script do
+  debug "Running test: testSelfMatchFails"
+  TestSetup{..} <- setup
+
+  -- Alice submits two opposing orders.
+  aliceBuyOrderCid <- submit alice do
+    exerciseCmd engineCid SubmitSealedOrder
+      with participant = alice, direction = Buy, quantity = 100.0, asset = "ZZZ", limitPrice = Some 10.0, detailsHash = "alice_buy_hash_4"
+
+  aliceSellOrderCid <- submit alice do
+    exerciseCmd engineCid SubmitSealedOrder
+      with participant = alice, direction = Sell, quantity = 100.0, asset = "ZZZ", limitPrice = Some 9.0, detailsHash = "alice_sell_hash_4"
+
+  -- The operator's attempt to match Alice's order with her own other order should fail.
+  submitMustFail operator do
+    exerciseCmd engineCid MatchOrders with order1Cid = aliceBuyOrderCid, order2Cid = aliceSellOrderCid
+
+  debug "SUCCESS: testSelfMatchFails"
+  return ()
