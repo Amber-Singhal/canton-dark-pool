@@ -1,0 +1,200 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module DarkPool.ParticipantRegistry where
+
+import Daml.Script
+
+-- | Defines the role of the dark pool operator. This contract serves as a stable
+-- | entry point for operator actions, such as inviting new participants. A key
+-- | is used to ensure it acts as a singleton for a given operator party.
+template OperatorRole
+  with
+    operator: Party
+      -- ^ The party operating the dark pool.
+  where
+    signatory operator
+    key operator: Party
+    maintainer key
+
+    -- | Invite a new institution to join the dark pool.
+    -- | This creates a `ParticipantInvitation` contract, which the potential participant
+    -- | must accept to become a member. A unique key on `ParticipantInvitation`
+    -- | prevents duplicate outstanding invitations for the same participant.
+    choice InviteParticipant : ContractId ParticipantInvitation
+      with
+        participant: Party
+          -- ^ The party being invited to join.
+        displayName: Text
+          -- ^ A human-readable name for the participant.
+      controller operator
+      do
+        create ParticipantInvitation with
+          operator
+          participant
+          displayName
+
+-- | An invitation for a party to join the dark pool. This contract must be
+-- | accepted by the invited party to create a `ParticipantRole` contract, which
+-- | formally establishes them as a member.
+template ParticipantInvitation
+  with
+    operator: Party
+      -- ^ The operator who sent the invitation.
+    participant: Party
+      -- ^ The party receiving the invitation.
+    displayName: Text
+      -- ^ The display name for the participant.
+  where
+    signatory operator
+    observer participant
+
+    key (operator, participant) : (Party, Party)
+    maintainer key._1
+
+    -- | The invited party accepts the invitation to join the dark pool.
+    -- | This action consumes the invitation and creates a `ParticipantRole` contract,
+    -- | which is co-signed by both the operator and the participant, solidifying
+    -- | the participant's status in the network.
+    choice Accept : ContractId ParticipantRole
+      controller participant
+      do
+        create ParticipantRole with
+          operator
+          participant
+          displayName
+
+-- | Represents an active, approved participant in the dark pool.
+-- | The existence of this contract on the ledger authorizes the `participant` party
+-- | to engage in trading activities, such as submitting sealed orders.
+-- | It is co-signed by both the operator and the participant.
+template ParticipantRole
+  with
+    operator: Party
+      -- ^ The operator of the dark pool.
+    participant: Party
+      -- ^ The approved institutional participant.
+    displayName: Text
+      -- ^ The display name of the participant.
+  where
+    signatory operator, participant
+
+    key (operator, participant) : (Party, Party)
+    maintainer key._1
+
+    -- | Allows the operator to unilaterally remove a participant from the dark pool.
+    -- | This action immediately revokes the participant's trading privileges by
+    -- | archiving this role contract.
+    choice TerminateParticipation : ()
+      controller operator
+      do
+        -- This is a consuming choice that returns unit, so it implicitly archives `self`.
+        return ()
+
+    -- | Allows a participant to initiate the process of leaving the dark pool.
+    -- | This creates a formal request that the operator can then acknowledge.
+    -- | This choice consumes the `ParticipantRole` and replaces it with an `OffboardingRequest`.
+    choice RequestOffboarding : ContractId OffboardingRequest
+      controller participant
+      do
+        create OffboardingRequest with
+          operator
+          participant
+          roleCid = self
+
+-- | A formal request from a participant to be removed from the dark pool.
+-- | This contract is created when a participant exercises the `RequestOffboarding` choice
+-- | on their `ParticipantRole` contract.
+template OffboardingRequest
+  with
+    operator: Party
+      -- ^ The operator who needs to acknowledge the request.
+    participant: Party
+      -- ^ The participant who submitted the request.
+    roleCid: ContractId ParticipantRole
+      -- ^ A reference to the original `ParticipantRole` contract. Note that this
+      -- | contract has already been archived when this request was created.
+      -- | It is stored here for audit purposes.
+  where
+    signatory participant
+    observer operator
+
+    key (operator, participant) : (Party, Party)
+    maintainer key._1
+
+    -- | The operator acknowledges the participant's request to leave,
+    -- | finalizing the offboarding process. In this simple model, acknowledging
+    -- | just archives the request itself. In a real system, this could trigger
+    -- | other clean-up workflows.
+    choice AcknowledgeOffboarding : ()
+      controller operator
+      do
+        return ()
+
+-- | A setup script for initializing and demonstrating the participant registry workflow.
+-- | This can be run via `dpm test`.
+setup_registry : Script ()
+setup_registry = script do
+  -- 1. Allocate parties
+  operator <- allocatePartyWithHint "DarkPoolOperator" (PartyIdHint "dark-pool-operator")
+  participant1 <- allocatePartyWithHint "BankA" (PartyIdHint "bank-a")
+  participant2 <- allocatePartyWithHint "HedgeFundB" (PartyIdHint "hedge-fund-b")
+
+  -- 2. Operator creates their role contract
+  operatorRoleCid <- submit operator do
+    createCmd OperatorRole with operator
+
+  -- 3. Operator invites BankA
+  debug $ "Operator inviting " <> show participant1
+  invitationCid <- submit operator do
+    exerciseCmd operatorRoleCid InviteParticipant with
+      participant = participant1
+      displayName = "Bank A Capital Markets"
+
+  -- 4. BankA accepts the invitation and is onboarded
+  participant1RoleCid <- submit participant1 do
+    exerciseCmd invitationCid Accept
+  debug $ "Participant " <> show participant1 <> " successfully onboarded with role " <> show participant1RoleCid
+
+  -- 5. Operator invites HedgeFundB
+  debug $ "Operator inviting " <> show participant2
+  invitation2Cid <- submit operator do
+    exerciseCmd operatorRoleCid InviteParticipant with
+      participant = participant2
+      displayName = "Hedge Fund B"
+
+  -- 6. HedgeFundB accepts the invitation
+  participant2RoleCid <- submit participant2 do
+    exerciseCmd invitation2Cid Accept
+  debug $ "Participant " <> show participant2 <> " successfully onboarded with role " <> show participant2RoleCid
+
+  -- 7. HedgeFundB requests to be offboarded
+  debug $ "Participant " <> show participant2 <> " is requesting offboarding."
+  offboardingRequestCid <- submit participant2 do
+    exerciseCmd participant2RoleCid RequestOffboarding
+
+  -- Verify participant 2's role is gone
+  p2Roles <- query @ParticipantRole participant2
+  assertMsg "Participant2's role should be archived after requesting offboarding" $ null p2Roles
+
+  -- 8. Operator acknowledges the offboarding request
+  debug $ "Operator acknowledging offboarding for " <> show participant2
+  submit operator do
+    exerciseCmd offboardingRequestCid AcknowledgeOffboarding
+  debug $ "Participant " <> show participant2 <> " has been fully offboarded."
+
+  -- Verify the offboarding request is gone
+  offboardingRequests <- query @OffboardingRequest operator
+  assertMsg "Offboarding request should be archived after acknowledgement" $ null offboardingRequests
+
+  -- 9. Operator directly terminates BankA's participation
+  debug $ "Operator is terminating participation for " <> show participant1
+  submit operator do
+    exerciseCmd participant1RoleCid TerminateParticipation
+
+  -- 10. Verify BankA's role contract is now archived
+  p1Roles <- query @ParticipantRole participant1
+  assertMsg "Participant1's role should be archived after termination" $ null p1Roles
+  debug $ "Participant " <> show participant1 <> " has been terminated."
+
+  return ()
