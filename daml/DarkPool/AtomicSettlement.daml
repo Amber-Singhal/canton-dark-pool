@@ -1,0 +1,155 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module DarkPool.AtomicSettlement where
+
+import Daml.Script
+import DA.Time (Time, getTime)
+import DA.Assert ((===), assertMsg)
+
+-- The settlement logic operates on a MatchedTrade contract, which is assumed
+-- to be defined in a separate module. We also assume it defines the Asset data type.
+import DarkPool.MatchedTrade (MatchedTrade(..), Asset(..))
+
+
+-- =================================================================================================
+-- BEGIN: Token Primitives
+-- Note: In a real-world project, these token definitions would reside in a separate file,
+-- e.g., `daml/DarkPool/Token.daml`, and be imported. They are included here to make this
+-- file self-contained and compilable. A production system would use a standardized token
+-- library based on CIP-0056.
+-- =================================================================================================
+
+-- | Uniquely identifies a class of fungible assets (e.g., USD issued by a specific bank).
+data AssetId = AssetId
+  with
+    symbol: Text
+    issuer: Party
+  deriving (Eq, Ord, Show)
+
+-- | Represents a holding of a fungible asset. The UTXO model is used: transfers
+-- archive the old contract and create a new one for the new owner.
+template Fungible
+  with
+    assetId: AssetId
+    owner: Party
+    quantity: Decimal
+  where
+    signatory assetId.issuer, owner
+    observer assetId.issuer
+
+    key (assetId, owner) : (AssetId, Party)
+    maintainer key._2
+
+    ensure quantity > 0.0
+
+    -- | Transfers ownership of the asset to a new party.
+    choice Transfer : ContractId Fungible
+      with
+        newOwner : Party
+      controller owner
+      do
+        -- Enforce that the asset is not transferred back to the same owner,
+        -- which would be a no-op and waste a transaction.
+        assertMsg "New owner must be different from the current owner" (newOwner /= owner)
+        create this with owner = newOwner
+
+-- =================================================================================================
+-- END: Token Primitives
+-- =================================================================================================
+
+
+-- | Represents an in-flight settlement proposal.
+-- This contract is created when one party to a `MatchedTrade` initiates settlement by providing
+-- their fungible asset. The contract waits for the counterparty to accept by providing theirs,
+-- at which point the atomic swap is executed.
+template SettlementProposal
+  with
+    tradeId: Text
+    proposer: Party
+    counterparty: Party
+    proposerAsset: Asset
+    counterpartyAsset: Asset
+    proposerFungibleCid: ContractId Fungible
+    matchedTradeCid: ContractId MatchedTrade
+    operator: Party
+  where
+    signatory proposer, counterparty, operator
+
+    key (operator, tradeId) : (Party, Text)
+    maintainer key._1
+
+    -- | The counterparty accepts the settlement by providing their fungible asset contract.
+    -- This triggers the atomic DvP (Delivery vs Payment) swap, consuming this proposal
+    -- and the original trade contract, and producing a final `SettledTrade` contract.
+    choice AcceptSettlement : ContractId SettledTrade
+      with
+        counterpartyFungibleCid: ContractId Fungible
+      controller counterparty
+      do
+        -- Fetch contracts for validation and execution
+        proposerFungible <- fetch proposerFungibleCid
+        counterpartyFungible <- fetch counterpartyFungibleCid
+        matchedTrade <- fetch matchedTradeCid
+
+        -- Validate proposer's fungible asset
+        assertMsg "Proposer's fungible is not owned by the proposer" $
+          proposerFungible.owner === proposer
+        assertMsg "Proposer's fungible asset symbol does not match trade" $
+          proposerFungible.assetId.symbol === proposerAsset.id
+        assertMsg "Proposer's fungible quantity does not match trade" $
+          proposerFungible.quantity === proposerAsset.quantity
+
+        -- Validate counterparty's fungible asset
+        assertMsg "Counterparty's fungible is not owned by the counterparty" $
+          counterpartyFungible.owner === counterparty
+        assertMsg "Counterparty's fungible asset symbol does not match trade" $
+          counterpartyFungible.assetId.symbol === counterpartyAsset.id
+        assertMsg "Counterparty's fungible quantity does not match trade" $
+          counterpartyFungible.quantity === counterpartyAsset.quantity
+
+        -- Atomically transfer assets
+        transferredToCounterpartyCid <- exercise proposerFungibleCid Transfer with newOwner = counterparty
+        transferredToProposerCid <- exercise counterpartyFungibleCid Transfer with newOwner = proposer
+
+        -- Archive the original matched trade. This proposal is archived implicitly
+        -- as this is a consuming choice.
+        exercise matchedTradeCid Archive
+
+        -- Create the final, immutable record of the settled trade
+        now <- getTime
+        create SettledTrade with
+          tradeId = matchedTrade.tradeId
+          partyA = matchedTrade.partyA
+          assetA = matchedTrade.assetA
+          partyB = matchedTrade.partyB
+          assetB = matchedTrade.assetB
+          operator = matchedTrade.operator
+          settlementTime = now
+          -- Assign the correct resulting fungible contract to each party for the audit trail.
+          -- Party A (seller of assetA) should receive assetB.
+          -- Party B (seller of assetB) should receive assetA.
+          partyAReceivedFungibleCid = if matchedTrade.partyA == proposer then transferredToProposerCid else transferredToCounterpartyCid
+          partyBReceivedFungibleCid = if matchedTrade.partyB == proposer then transferredToProposerCid else transferredToCounterpartyCid
+
+-- | An immutable, archival record of a successfully settled trade.
+-- This contract serves as a permanent, auditable proof of the completed transaction
+-- for all stakeholders.
+template SettledTrade
+  with
+    tradeId: Text
+    partyA: Party
+    assetA: Asset
+    partyB: Party
+    assetB: Asset
+    operator: Party
+    settlementTime: Time
+    -- | The new fungible asset (originally assetB) now owned by Party A.
+    partyAReceivedFungibleCid: ContractId Fungible
+    -- | The new fungible asset (originally assetA) now owned by Party B.
+    partyBReceivedFungibleCid: ContractId Fungible
+  where
+    signatory partyA, partyB, operator
+
+    key (operator, tradeId) : (Party, Text)
+    maintainer key._1
