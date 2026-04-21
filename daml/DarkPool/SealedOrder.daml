@@ -1,77 +1,89 @@
--- | This module defines the core `SealedOrder` contract, which represents a
--- | trader's private, confidential order in the dark pool.
--- |
--- | The key privacy feature of the system is that this contract is only visible
--- | to the `trader` who creates it. The dark pool `operator` is *not* a stakeholder
--- | and cannot see the order's details, particularly the `limitPrice`.
--- |
--- | This contract serves as the trader's cryptographic proof of their trading
--- | intention, which they can later use to consent to a match proposed by the
--- | operator without revealing their limit price pre-emptively.
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module DarkPool.SealedOrder where
 
-import Daml.Finance.Interface.Asset.Instrument qualified as Instrument (K)
-import DA.Time (Time)
+import DarkPool.ParticipantRegistry qualified as ParticipantRegistry
 
--- | Defines the side of an order: either Buy or Sell.
+-- | Defines whether an order is to buy or sell an asset.
 data Side = Buy | Sell
-  deriving (Eq, Show, Ord)
+  deriving (Eq, Ord, Show)
 
--- | Represents a sealed limit order, visible only to the trader who submitted it.
--- |
--- | This contract acts as the trader's private record of their intent to trade,
--- | including the confidential limit price. It is the source of truth for the trader
--- | when consenting to a match proposed by the dark pool operator.
+-- | A sealed, private order submitted to the dark pool.
+-- The order details are only visible to the owner and the operator until a match occurs.
+-- This template now includes a `minFillSize` to prevent economically unviable partial fills.
 template SealedOrder
   with
-    trader       : Party
-      -- ^ The party who submitted the order and is the sole signatory.
-    operator     : Party
-      -- ^ The operator of the dark pool. Not a stakeholder on this contract, but
-      -- ^ their identity is recorded for use in subsequent interactions.
-    orderId      : Text
-      -- ^ A client-provided unique identifier for the order, used for idempotency and tracking.
-    instrument   : Instrument.K
-      -- ^ The key of the instrument being traded.
-    side         : Side
-      -- ^ The direction of the trade (Buy or Sell).
-    quantity     : Decimal
-      -- ^ The amount of the instrument to be traded. Must be positive.
-    limitPrice   : Decimal
-      -- ^ The price limit for the order. For a Buy order, this is the maximum price
-      -- ^ the trader is willing to pay. For a Sell order, this is the minimum price
-      -- ^ the trader is willing to accept. Must be positive.
-    submittedAt  : Time
-      -- ^ The timestamp when the order was created.
+    operator          : Party
+    -- ^ The operator of the dark pool, responsible for running the matching engine.
+    owner             : Party
+    -- ^ The institutional participant who submitted the order.
+    orderId           : Text
+    -- ^ A unique identifier for the order, provided by the owner.
+    registry          : ContractId ParticipantRegistry.Registry
+    -- ^ The registry contract to verify participant status.
+    isin              : Text
+    -- ^ The ISIN of the instrument to be traded.
+    side              : Side
+    -- ^ Whether this is a buy or a sell order.
+    quantity          : Decimal
+    -- ^ The total quantity of the instrument for this order.
+    limitPrice        : Decimal
+    -- ^ The price limit for the order (max for Buy, min for Sell).
+    minFillSize       : Decimal
+    -- ^ The minimum acceptable quantity for a partial fill. A fill can be smaller
+    --   if it completes the entire remaining quantity of the order.
+    remainingQuantity : Decimal
+    -- ^ The quantity that is still available to be matched.
   where
-    signatory trader
+    signatory owner
+    observer operator
 
-    ensure
-      quantity > 0.0 && limitPrice > 0.0
+    ensure remainingQuantity > 0.0 && remainingQuantity <= quantity
+    ensure limitPrice > 0.0
+    ensure quantity > 0.0
+    ensure minFillSize >= 0.0 && minFillSize <= quantity
 
-    key (trader, orderId) : (Party, Text)
+    key (owner, orderId) : (Party, Text)
     maintainer key._1
 
-    -- | Allows the trader to unilaterally cancel their order at any time before it is matched.
-    -- | Cancelling an order here only removes the private record. The trader is responsible
-    -- | for instructing the operator to remove any corresponding public-facing order instruction.
+    -- | Allows the owner to unilaterally cancel their order before it is fully matched.
     choice Cancel : ()
-      controller trader
+      controller owner
       do
-        pure ()
+        archive self
 
-    -- | A non-consuming choice that allows the trader (or automation acting on their behalf)
-    -- | to check if a proposed match price from the operator is compliant with their
-    -- | secret limit price.
-    -- |
-    -- | Returns `True` if the match is valid, `False` otherwise.
-    nonconsuming choice IsValidMatchPrice : Bool
+    -- | This choice is exercised by the Matching Engine operator to consume part or all of an
+    -- | order as part of a confirmed match. It validates the match against the order's
+    -- | parameters (including minimum fill size) and creates a remainder order if the
+    -- | fill is partial. The atomicity of the full trade is handled by the Matching Engine.
+    consuming choice AcceptMatch
+      : Optional (ContractId SealedOrder)
+      -- ^ Returns the contract ID of the remainder order, if any.
+      controller operator
       with
-        matchPrice : Decimal
-          -- ^ The price at which a potential match would execute.
-      controller trader
+        matchQuantity: Decimal
+        -- ^ The quantity being filled in this match.
       do
-        ensure matchPrice > 0.0
-        pure case side of
-          Buy  -> matchPrice <= limitPrice
-          Sell -> matchPrice >= limitPrice
+        -- --- Validation ---
+        -- Ensure the match respects the order's constraints.
+        assertMsg "Match quantity must be positive" (matchQuantity > 0.0)
+        assertMsg "Match quantity cannot exceed remaining quantity" (matchQuantity <= remainingQuantity)
+
+        -- This is the new business rule. A fill must be at least the minimum size,
+        -- unless it is the final fill that completes the order.
+        assertMsg "Match quantity is below this order's minimum fill size."
+          (matchQuantity >= self.minFillSize || matchQuantity == self.remainingQuantity)
+
+        -- --- Handle Remainder ---
+        let newRemaining = remainingQuantity - matchQuantity
+
+        -- If there's a remaining quantity, create a new order contract for it.
+        -- Otherwise, the order is fully filled and no new contract is needed.
+        -- The original contract is archived because this choice is `consuming`.
+        -- A new contract with the same key can be created in the same transaction.
+        if newRemaining > 0.0 then do
+          remainderCid <- create self with remainingQuantity = newRemaining
+          return (Some remainderCid)
+        else
+          return None
